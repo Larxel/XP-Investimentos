@@ -1,0 +1,244 @@
+---
+title: "Binary prediction"
+author: "Andrew Maranhão"
+output:
+  prettydoc::html_pretty:
+    theme: tactile
+    highlight: github
+---
+
+# Resumo
+
+Iniciei esse desafio criando algumas features com base nos dados fornecidos.
+Apesar da abordagem clássica girar em torno de uma EDA, comecei criando um modelo baseline para então focar minha atenção nas features mais importantes.
+Pela modelagem baseline, descobri problemas no dataset, como um data leak que causa grande perda em modelos.
+Para sanar esse cenário, realizei uma EDA olhando feature à feature, selecionando as tidas como mais relevantes
+Em seguida submeti um modelo duplamente validado com cross validation e um holdout set.
+Por fim, na falta de tempo, obtive apenas um RandomForest com 0.838 AUC.
+
+
+# Introdução
+
+
+
+```{r, warning=FALSE,message=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(lubridate)
+library(caTools)
+library(ranger)
+library(pROC)
+library(caret)
+setwd("~/Documents/XP Investimentos/real")
+set.seed(451)
+
+# [] Read Data
+raw.data  = fread("_transacao_train.csv")
+test.data = fread("_transacao_test.csv")
+additional.data = fread("_pessoas.csv")
+
+
+# [] Join training data with pessoas df
+raw.data  = merge(raw.data, additional.data,  by="ID")
+test.data = merge(test.data, additional.data, by="ID")
+```
+
+
+
+
+# Preparação de Dados
+Os arquivos vieram em formato long, para análisa-los, realizaros a transformação para wide usando `dcast`.
+
+```{r}
+# [] Isolate labels
+label = raw.data$retorno
+raw.data$retorno = NULL
+
+# [] Clone data for safekeeping
+full.data  = raw.data
+glimpse(full.data)
+
+# [] Check NAs
+colSums(is.na(full.data))
+
+# [] Check stats
+summary(full.data)
+
+```
+
+Agora, criaremos algumas features baseadas nas data fornecidas.
+
+```{r}
+# [] Create time-based features
+full.data$data.x = as.Date(full.data$data.x, format='%Y-%m-%d')
+full.data$data.y = as.Date(full.data$data.y, format='%Y-%m-%d')
+
+full.data$weekday_x = wday(full.data$data.x)
+full.data$weekday_y = wday(full.data$data.y)
+
+full.data$numday_x = day(full.data$data.x)
+full.data$numday_y = day(full.data$data.y)
+
+full.data$month_x  = month(full.data$data.x)
+full.data$month_y  = month(full.data$data.y)
+
+full.data$year_x   = year(full.data$data.x) - 2018
+full.data$year_y   = year(full.data$data.y) - 2018
+
+full.data$time_dif = as.numeric(full.data$data.x) - as.numeric(full.data$data.y)
+```
+
+Já que os dados são anônimos, é necessário analisar as features para descobrir qual sua natureza:
+
+```{r}
+# [] Inspect Cardinality
+cardinality = function(x){
+  x = x %>% as.data.frame()
+  for (j in 1:ncol(x)){
+    print(paste0(colnames(x)[j],": ",length(unique(x[,j])), " dtype:",class(x[,j])))
+  }
+}
+
+cardinality(full.data)
+```
+
+Com as features compreendidas, chegou a hora de trata-las adequadamente.
+A `var1` possui 2 valores únicos e foi interpretada como categórica, logo podemos torna-la binária.
+Criaremos também features summarizando
+
+
+
+```{r}
+# [] Convert var1 to binary
+full.data$var1 = ifelse(full.data$var1 == "tipo2",1,0)
+
+# [] Create count list and past results list
+full.data$retorno = label
+count_list  = full.data  %>% group_by(ID) %>% summarize(count = n())
+past_result = full.data  %>% group_by(ID) %>% summarize(past_result = mean(retorno))
+
+
+# [] Add these variables in the main dataset
+full.data = merge(full.data, count_list,  by="ID")
+full.data = merge(full.data, past_result, by="ID")
+```
+
+Vamos então unir o dataset de estudantes, filtrando seus valores duplicados, e , em seguida, uni-lo com o dataframe de escolas.
+
+# Análise Exploratória
+
+Para economizar tempo, criei algumas funções padrão para os tipos de plot que usarei à frente.
+
+```{r}
+# [] Helper Functions for EDA
+quickplot_density = function(variable){
+  ggplot(full.data, aes(x=variable, fill=as.factor(retorno)))+
+    geom_density(color="white",alpha=0.8)+
+    theme_hc(bgcolor = 'darkunica')+
+    ggtitle(paste0(substr(deparse(substitute(variable)),11,99)," vs Retorno"))
+}
+
+quickplot_bar = function(variable){
+  ggplot(full.data, aes(x=variable, y=1, fill=as.factor(retorno)))+
+    geom_bar(stat="identity",position='fill',alpha=0.8)+
+    theme_hc(bgcolor = 'darkunica')+
+    ggtitle(paste0(substr(deparse(substitute(variable)),11,99)," vs Retorno"))
+}
+
+
+quickplot_boxplot = function(variable){
+  ggplot(full.data, aes(x=variable, y=1, fill=as.factor(retorno)))+
+    geom_boxplot(color="white",alpha=0.8)+
+    theme_hc(bgcolor = 'darkunica')+
+    ggtitle(paste0(substr(deparse(substitute(variable)),11,99)," vs Retorno"))
+}
+
+quickplot_violin = function(variable){
+ggplot(full.data, aes(x=variable,y=var38))+
+  geom_violin(aes(fill=as.factor(retorno)), position="identity",alpha=0.7,color="grey65",width=1.5)+
+  theme_hc(bgcolor="darkunica")+
+  scale_fill_manual(values=c("cyan3","maroon3"))+
+  ggtitle(paste0(substr(deparse(substitute(variable)),11,99)," vs Retorno"))
+}
+```
+
+# Variáveis de Interesse
+
+A seleção de features foi feita sob a forma de visualização, já que um randomforest levou em torno de 15 minutos, caso um algoritmo como boruta fosse utilizado, não haveria tempo suficiente.
+Seguem algumas das features selecionadas
+
+```{r}
+# [] Confirmed Features
+quickplot_density(full.data$var38)
+quickplot_density(full.data$time_dif)
+quickplot_density(full.data$month_x)
+quickplot_density(full.data$month_y)
+quickplot_density(full.data$numday_x)
+quickplot_density(full.data$numday_y)
+quickplot_density(full.data$var1)
+```
+
+
+# Variáveis Rejeitadas
+
+Aqui estão algumas das variáveis rejeitadas.
+Um caso em especial se refere à variável `past_result`. Com ela foi possível gerar um randomforest de 0.90+ auc... e por essa razão foi excluída do modelo final.
+
+A decisão por trás da exclusão se baseou em:
+- (1) Todos os ids estão presentes nos dois sets, o que introduz um bias sistêmico sob a forma de data leak, na medida em que não há total independência entre o set de treino e teste, e logo seu potencial de generalização fica comprometido.
+- (2) Por razões práticas, essa feature tomaria a importância das demais, o que causaria que comprometeria o funcionamento do modelo para clientes novos - em termos de negócio, isso seria catastrófico.
+
+```{r}
+# [] Special case: past_result
+quickplot_density(full.data$past_result)
+```
+
+Demais variáveis rejeitadas:
+
+```{r}
+# [] Rejected features
+quickplot_density(full.data$year_y)
+quickplot_density(full.data$year_x)
+quickplot_density(full.data$weekday_x)
+quickplot_density(full.data$weekday_y)
+quickplot_density(full.data$var10.y)
+
+quickplot_density(full.data$var11)
+quickplot_density(full.data$var12)
+quickplot_density(full.data$var13)
+```
+
+
+# Modelagem Final 
+
+```{r}
+# [] Isolate selected features
+selected_features = c('retorno','var38','time_dif','month_x','month_y','numday_x','numday_y','var1','categoria') #'grupo' removed for too high RAM cost
+full.data = full.data %>% as.data.frame()
+training_data = full.data[,selected_features]
+
+# [] Train / Holdout Split
+splitr = sample.split(training_data$retorno, SplitRatio = 0.7)
+train  = subset(training_data, splitr == TRUE)
+probe  = subset(training_data, splitr == FALSE)
+```
+
+A maior parte do meu tempo se deu na busca pela interferência que ocorria, sobrando relativamente pouco tempo para o modelo final
+O modelo randomforest, com apenas 100 árvores e treinado em torno de acurácia alcançou a marca de 0.838 no holdout set.
+Idealmente, poderia-se usar também `auc`, na medida em que para aplicações práticas a `auc` pode conciliar diferentes necessidades de thresholds, como em fraude (um threshold para aviso e outro para bloqueio do cartão).
+
+```{r}
+rf.model = ranger(retorno ~ ., data=train, importance = 'impurity', num.trees=100)
+
+rf.pred = predict(rf.model, probe)
+table(probe$retorno, rf.pred$predictions >= 0.5)
+
+# [] Calculate auc
+glmnet::auc(probe$retorno, rf.pred$predictions)
+```
+
+
+
+
