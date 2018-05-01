@@ -11,15 +11,22 @@ output:
 
 Iniciei esse desafio criando algumas features com base nos dados fornecidos.
 Apesar da abordagem clássica girar em torno de uma EDA, comecei criando um modelo baseline para então focar minha atenção nas features mais importantes.
-Pela modelagem baseline, descobri problemas no dataset, como um data leak que causa grande perda em modelos.
-Para sanar esse cenário, realizei uma EDA olhando feature à feature, selecionando as tidas como mais relevantes
-Em seguida submeti um modelo duplamente validado com cross validation e um holdout set.
-Por fim, na falta de tempo, obtive apenas um RandomForest com 0.838 AUC.
+
+Como métrica chave, usei auc, uma vez que ela é talvez a métrica mais flexível de todas, permitindo
+Pela modelagem baseline, descobri problemas no dataset, como um **data leak** que causa grande perda em modelos.
+
+Para sanar esse cenário, realizei uma EDA olhando feature à feature, selecionando as tidas como mais relevantes.
+Como resultado da EDA, identifiquei o leak como sendo fonte da depedência entre clientes e a eliminei.
+
+A exploração do **leak garante uma auc de 0.9786** no holdout set e dado que o test set possui os mesmo clientes contidos no leak, sua auc também tende a ser alta - mas pela invalidade prática desse método, eu o descartei.
+
+Em seguida submeti um modelo duplamente validado com uma rodada de cross validation e outra em um holdout set estratificado.
+Por fim, uma combinação linear de um Lightgbm com uma DNN feita em Keras geraram uma auc de 0.8886 usando apenas 8 features.
 
 
 # Introdução
 
-
+Vamos começar a EDA e Data Prep carregando algumas libs.
 
 ```{r, warning=FALSE,message=FALSE}
 library(data.table)
@@ -34,33 +41,33 @@ library(caret)
 setwd("~/Documents/XP Investimentos/real")
 set.seed(451)
 
-# [] Read Data
+# [1] Read Data
 raw.data  = fread("_transacao_train.csv")
 test.data = fread("_transacao_test.csv")
 additional.data = fread("_pessoas.csv")
-
-
-# [] Join training data with pessoas df
-raw.data  = merge(raw.data, additional.data,  by="ID")
-test.data = merge(test.data, additional.data, by="ID")
 ```
 
 
 
 
 # Preparação de Dados
-Os arquivos vieram em formato long, para análisa-los, realizaros a transformação para wide usando `dcast`.
+
+Em seguida, vamos unir os dados, verificar a presença de `NAs` e ver as estatísticas descritivas dos dados.
 
 ```{r}
-# [] Isolate labels
+# [2] Join training data with pessoas df
+raw.data  = merge(raw.data, additional.data,  by="ID")
+test.data = merge(test.data, additional.data, by="ID")
+
+# [3] Isolate labels
 label = raw.data$retorno
 raw.data$retorno = NULL
 
-# [] Clone data for safekeeping
+# [4] Clone data for safekeeping
 full.data  = raw.data
 glimpse(full.data)
 
-# [] Check NAs
+# [5] Check NAs
 colSums(is.na(full.data))
 
 # [] Check stats
@@ -68,7 +75,7 @@ summary(full.data)
 
 ```
 
-Agora, criaremos algumas features baseadas nas data fornecidas.
+Agora, criaremos algumas features baseadas nas datas fornecidas.
 
 ```{r}
 # [] Create time-based features
@@ -104,9 +111,10 @@ cardinality = function(x){
 cardinality(full.data)
 ```
 
-Com as features compreendidas, chegou a hora de trata-las adequadamente.
+Com as features compreendidas, chegou a hora de tratá-las adequadamente.
 A `var1` possui 2 valores únicos e foi interpretada como categórica, logo podemos torna-la binária.
-Criaremos também features summarizando
+
+Criaremos também features summarizando a contagem e os retornos passados de cada cliente, similar a uma whitelist/blacklist - Estas serão cruciais mais a frente.
 
 
 
@@ -125,11 +133,28 @@ full.data = merge(full.data, count_list,  by="ID")
 full.data = merge(full.data, past_result, by="ID")
 ```
 
-Vamos então unir o dataset de estudantes, filtrando seus valores duplicados, e , em seguida, uni-lo com o dataframe de escolas.
+
 
 # Análise Exploratória
 
-Para economizar tempo, criei algumas funções padrão para os tipos de plot que usarei à frente.
+A esse ponto, eu criei um modelo baseline - um randomforest de 100 árvores treinado com acurácia, obtendo uma auc de apenas 0.608, levando mais de 30 minutos para rodar.
+
+O contraste entre as features de importância do modelo baseline com a EDA foram essenciais para a seleção de variáveis, bem como para a descoberta do **leak**
+
+```{r, eval=FALSE}
+# Obs: Os modelos não serão executados no Rmarkdown, já que isso significaria a necessidade de pelo menos mais 1 hora!
+# [] Baseline model
+rf.model = ranger(retorno ~ ., data=train, importance = 'impurity', num.trees=100)
+
+rf.pred = predict(rf.model, probe)
+table(probe$retorno, rf.pred$predictions >= 0.5)
+
+# [] Calculate auc
+glmnet::auc(probe$retorno, rf.pred$predictions) #0.6085423
+```
+
+Com novas features criadas, vamos realizar a seleção das features que mais sensibilizam a variável de efeito.
+Existem interações entre variáveis explicatórias, mas elas não foram levadas em conta por economia de tempo.
 
 ```{r}
 # [] Helper Functions for EDA
@@ -166,7 +191,7 @@ ggplot(full.data, aes(x=variable,y=var38))+
 
 # Variáveis de Interesse
 
-A seleção de features foi feita sob a forma de visualização, já que um randomforest levou em torno de 15 minutos, caso um algoritmo como boruta fosse utilizado, não haveria tempo suficiente.
+A seleção de features foi feita sob a forma de visualização, já que um randomforest levou em torno de 30 minutos, caso um algoritmo como boruta fosse utilizado, não haveria tempo suficiente.
 Seguem algumas das features selecionadas
 
 ```{r}
@@ -184,16 +209,38 @@ quickplot_density(full.data$var1)
 # Variáveis Rejeitadas
 
 Aqui estão algumas das variáveis rejeitadas.
-Um caso em especial se refere à variável `past_result`. Com ela foi possível gerar um randomforest de 0.90+ auc... e por essa razão foi excluída do modelo final.
-
-A decisão por trás da exclusão se baseou em:
-- (1) Todos os ids estão presentes nos dois sets, o que introduz um bias sistêmico sob a forma de data leak, na medida em que não há total independência entre o set de treino e teste, e logo seu potencial de generalização fica comprometido.
-- (2) Por razões práticas, essa feature tomaria a importância das demais, o que causaria que comprometeria o funcionamento do modelo para clientes novos - em termos de negócio, isso seria catastrófico.
+Um caso em especial se refere à variável `past_result`. Com ela foi possível gerar um randomforest de 0.97+ auc... e por essa razão foi excluída do modelo final.
 
 ```{r}
 # [] Special case: past_result
 quickplot_density(full.data$past_result)
 ```
+
+
+O uso crú dessa feature gera uma auc de 0.9786....
+
+![](thonking.png)
+
+
+```{r,eval=FALSE}
+#===================================================================================
+# Being a Dick Approach
+#===================================================================================
+past_result$pred = round(past_result$past_result)
+
+probe = fread("holdout_set2.csv") %>% as.data.frame()
+probe = merge(probe, past_result, by="ID")
+probe$retorno = ifelse(probe$retorno == "Sim",1,0)
+
+glmnet::auc(probe$retorno, probe$pred) #0.9785612
+```
+
+
+A decisão por trás da exclusão se baseou em:
+
+- (1) Todos os ids estão presentes nos dois sets, o que introduz um bias sistêmico sob a forma de data leak, na medida em que não há total independência entre o set de treino e teste, e logo seu potencial de generalização fica comprometido.
+- (2) Por razões práticas, essa feature tomaria a importância das demais, o que causaria que comprometeria o funcionamento do modelo para clientes novos - em termos de negócio, esse modelo completamente excluiria novos clientes.
+
 
 Demais variáveis rejeitadas:
 
@@ -211,9 +258,14 @@ quickplot_density(full.data$var13)
 ```
 
 
-# Modelagem Final 
+# Modelagem SemiFinal e Correção do Leak
 
-```{r}
+Com as variáveis selecionadas e o leak identificado, é hora de modelar!
+Isolando as features selecionadas, podemos então fazer train/holdout split.
+
+Removendo a duplicidade de registros de mesmo clientes diminuiremos drasticamente o tamanho do dataset, mas ao mesmo tempo removeremos o leak ao forçar o modelo à compreender o fenômeno, ao invés de ser contaminado por observações interdependentes.
+
+```{r,eval=FALSE}
 # [] Isolate selected features
 selected_features = c('retorno','var38','time_dif','month_x','month_y','numday_x','numday_y','var1','categoria') #'grupo' removed for too high RAM cost
 full.data = full.data %>% as.data.frame()
@@ -223,21 +275,62 @@ training_data = full.data[,selected_features]
 splitr = sample.split(training_data$retorno, SplitRatio = 0.7)
 train  = subset(training_data, splitr == TRUE)
 probe  = subset(training_data, splitr == FALSE)
+
+# [] Leak removal
+truthfull.data = train[!duplicated(train$ID),]
+truthfull.data$ID = NULL
 ```
 
-A maior parte do meu tempo se deu na busca pela interferência que ocorria, sobrando relativamente pouco tempo para o modelo final
-O modelo randomforest, com apenas 100 árvores e treinado em torno de acurácia alcançou a marca de 0.838 no holdout set.
-Idealmente, poderia-se usar também `auc`, na medida em que para aplicações práticas a `auc` pode conciliar diferentes necessidades de thresholds, como em fraude (um threshold para aviso e outro para bloqueio do cartão).
+Em seguida, criaremos um randomforest tunado com cross validation, treinado sobre o training set sem leak (`truthfull.data`) e validado duas vezes.
 
-```{r}
-rf.model = ranger(retorno ~ ., data=train, importance = 'impurity', num.trees=100)
+O cenário de data leakage é na realidade um dos mais preocupantes, na medida em que age na fonte de qualquer observação e pode facilmente inviabilizar uma análise ou modelo.
+Por essa razão, usei a dupla validação (cv + holdout) para garantir a integridade dos resultados.
 
-rf.pred = predict(rf.model, probe)
-table(probe$retorno, rf.pred$predictions >= 0.5)
+Em relação á métrica escolhida, para aplicações práticas a `auc` pode conciliar diferentes necessidades de thresholds, como em fraude (um threshold para aviso e outro para bloqueio do cartão), além de naturalmente conduzir à acurácia. Sem um caso de uso ou entendimento do que é o target, creio que essa seria a melhor métrica.
 
-# [] Calculate auc
-glmnet::auc(probe$retorno, rf.pred$predictions)
+```{r,eval=FALSE}
+# [] Set CV Parameters and Grid
+train.ctrl = trainControl(method="cv",number=4,classProbs=T,summaryFunction = twoClassSummary)
+rf.grid    = expand.grid(mtry=c(3,4,5),
+                         splitrule='gini',
+                         min.node.size=1)
+
+# [] Reencode targets (so caret won't crash)
+train$retorno  = ifelse(train$retorno == 1,"Sim","Nao")
+probe$retorno  = ifelse(probe$retorno == 1,"Sim","Nao")
+
+
+# [] Train semifinal model (CV + Holdout validated)
+rf.model = train(as.factor(retorno) ~ ., data=truthfull.data, method="ranger", num.trees=500,
+                 trControl = train.ctrl, metric='ROC', tuneGrid = rf.grid) #0.83582
+# [] Measure results
+rf.pred = predict(rf.model, probe,type = 'prob')
+table(probe$retorno, rf.pred$Sim >= 0.5)
+
+probe$retorno  = ifelse(probe$retorno == "Sim",1,0)
+
+glmnet::auc(probe$retorno, rf.pred$Sim) #0.833531
 ```
+
+Este modelo serviu apenas para garantir alguma submissão, a essa altura faltavam menos de 30 minutos e eu não havia terminado o treinamento da rede neural e o ensemble feito em python.
+Optei por deixar eles treinando após criar esse modelo e depois atualizar esse markdown com os resultados.
+
+Usando os mesmos dados e esquema de validação desse randomforest, criei um Lightgbm e uma rede neural em keras, com duas camadas e regularizada severamente com Dropout de 50%.
+Para elevar a velocidade de treino, utilizei inicialização HE e batch normalization.
+
+EDIT:
+
+Added meme
+
+A combinação linear dos modelos obteve os seguintes resultados:
+(Holdout Set | AUC):
+
+- Lightgbm:        0.8885450006107667
+- DNN:             0.8862473179273296
+- Linear Stacking: 0.8886615658398007
+
+Para mais detalhes nesses modelos, por favor consulte o notebook.
+Obrigado!
 
 
 
